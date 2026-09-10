@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import urllib.request
 import sqlite3
 import tempfile
 import time
@@ -408,12 +410,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await status.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=quality_menu())
     except Exception as exc:
-        logger.warning("Info extraction failed: %s", exc)
+        # لا نوقف المستخدم عند فشل قراءة البيانات الوصفية. بعض المنصات تمنع
+        # الاستعلام المسبق بينما تسمح بالتنزيل نفسه، لذلك نعرض الخيارات ونجرّب
+        # محركات التنزيل عند اختيار الصيغة.
+        logger.warning("Info extraction failed; continuing with fallback flow: %s", exc)
+        platform = detect_platform(url)
+        context.user_data["media_info"] = {
+            "title": "Media",
+            "uploader": "",
+            "duration": "",
+            "platform": platform,
+        }
         await status.edit_text(
-            "<b>⚠️ تعذر قراءة الرابط</b>\n\n"
-            "تأكد أن الرابط عام وصحيح. بعض الروابط قد تحتاج تحديث yt-dlp أو قد تكون "
-            "خاصة/محميّة وغير قابلة للتنزيل.",
+            "<b>🔗 تم استلام الرابط</b>\n\n"
+            f"🌐 {html.escape(platform)}\n"
+            "سأجرّب أكثر من طريقة تلقائيًا عند التحميل.\n\n"
+            "<b>اختر الصيغة والجودة:</b>",
             parse_mode=ParseMode.HTML,
+            reply_markup=quality_menu(),
         )
 
 
@@ -558,16 +572,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 read_timeout=180,
                 connect_timeout=60,
             )
-            if mode == "video":
+            ext = file_path.suffix.lower()
+            if mode == "audio" and ext in {".mp3", ".m4a", ".aac", ".ogg", ".wav"}:
+                await query.message.reply_audio(
+                    audio=InputFile(f, filename=file_path.name),
+                    title=title[:64],
+                    **common_kwargs,
+                )
+            elif ext in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}:
                 await query.message.reply_video(
                     video=InputFile(f, filename=file_path.name),
                     supports_streaming=True,
                     **common_kwargs,
                 )
+            elif ext in {".jpg", ".jpeg", ".png", ".webp"}:
+                await query.message.reply_photo(
+                    photo=InputFile(f, filename=file_path.name),
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    write_timeout=180,
+                    read_timeout=180,
+                    connect_timeout=60,
+                )
             else:
-                await query.message.reply_audio(
-                    audio=InputFile(f, filename=file_path.name),
-                    title=title[:64],
+                await query.message.reply_document(
+                    document=InputFile(f, filename=file_path.name),
                     **common_kwargs,
                 )
 
@@ -603,10 +632,18 @@ def base_ydl_options() -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 25,
-        "retries": 3,
-        "fragment_retries": 3,
-        "extractor_retries": 3,
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 5,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Accept-Language": "ar,en-US;q=0.8,en;q=0.6",
+        },
     }
 
 
@@ -658,8 +695,83 @@ def video_format(quality: str) -> str:
     )
 
 
+def _pick_downloaded_file(temp_dir: Path, mode: str) -> Path:
+    files = [
+        p for p in temp_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() not in {".part", ".ytdl", ".temp", ".json"}
+    ]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        raise RuntimeError("لم يتم إنشاء ملف نهائي")
+    preferred = [".mp3", ".m4a", ".aac", ".ogg"] if mode == "audio" else [
+        ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".jpg", ".jpeg", ".png", ".webp"
+    ]
+    for ext in preferred:
+        for path in files:
+            if path.suffix.lower() == ext:
+                return path
+    return files[0]
+
+
+def _ffmpeg_to_mp3(source: Path, quality: str, temp_dir: Path) -> Path:
+    if source.suffix.lower() == ".mp3":
+        return source
+    target = temp_dir / "Onyx_Audio.mp3"
+    bitrate = quality if quality in {"128", "192", "320"} else "192"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(source), "-vn", "-b:a", f"{bitrate}k", str(target)
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not target.exists():
+        raise RuntimeError("تعذر استخراج الصوت من الملف")
+    return target
+
+
+def _gallery_dl_download(url: str, temp_dir: Path) -> Path:
+    cmd = [
+        "python", "-m", "gallery_dl",
+        "--dest", str(temp_dir),
+        "--no-mtime",
+        url,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "gallery-dl failed").strip().splitlines()[-1]
+        raise RuntimeError(tail)
+    return _pick_downloaded_file(temp_dir, "video")
+
+
+def _direct_media_download(url: str, temp_dir: Path) -> Path:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
+            "Accept": "*/*",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        ctype = (resp.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+        ext_map = {
+            "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+            "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/ogg": ".ogg",
+            "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+        }
+        suffix = ext_map.get(ctype)
+        if not suffix:
+            path_suffix = Path(urlparse(url).path).suffix.lower()
+            suffix = path_suffix if path_suffix in {".mp4", ".webm", ".mov", ".m4a", ".mp3", ".ogg", ".jpg", ".jpeg", ".png", ".webp"} else None
+        if not suffix:
+            raise RuntimeError("الرابط ليس ملف وسائط مباشرًا")
+        target = temp_dir / f"onyx_media{suffix}"
+        with target.open("wb") as f:
+            shutil.copyfileobj(resp, f)
+    return target
+
+
 def download_media(url: str, mode: str, quality: str, temp_dir: Path):
-    output_template = str(temp_dir / "%(title).100s [%(id)s].%(ext)s")
+    """Try yt-dlp first, then gallery-dl, then direct-media download."""
+    errors = []
+    output_template = str(temp_dir / "onyx_%(id).48s.%(ext)s")
     common = {
         **base_ydl_options(),
         "outtmpl": output_template,
@@ -683,34 +795,41 @@ def download_media(url: str, mode: str, quality: str, temp_dir: Path):
             **common,
             "format": video_format(quality),
             "merge_output_format": "mp4",
-            # إعادة ترميز الحاوية فقط عند الحاجة؛ لا نفرض تحويلًا ثقيلًا لكل ملف.
             "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
         }
 
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info and info.get("entries"):
-            entries = [e for e in info["entries"] if e]
-            if entries:
-                info = entries[0]
-        title = str(info.get("title") or "Onyx Media")
-        platform = str(info.get("extractor_key") or info.get("extractor") or detect_platform(url))
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info and info.get("entries"):
+                entries = [e for e in info["entries"] if e]
+                if entries:
+                    info = entries[0]
+            title = str(info.get("title") or "Onyx Media")
+            platform = str(info.get("extractor_key") or info.get("extractor") or detect_platform(url))
+        return _pick_downloaded_file(temp_dir, mode), title, platform
+    except Exception as exc:
+        errors.append(f"yt-dlp: {clean_error(exc)}")
+        logger.warning("yt-dlp download failed; trying gallery-dl: %s", exc)
 
-    files = [
-        p for p in temp_dir.iterdir()
-        if p.is_file() and p.suffix.lower() not in {".part", ".ytdl", ".temp"}
-    ]
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        raise RuntimeError("لم يتم إنشاء ملف نهائي")
+    try:
+        downloaded = _gallery_dl_download(url, temp_dir)
+        if mode == "audio":
+            downloaded = _ffmpeg_to_mp3(downloaded, quality, temp_dir)
+        return downloaded, "Onyx Media", detect_platform(url)
+    except Exception as exc:
+        errors.append(f"gallery-dl: {clean_error(exc)}")
+        logger.warning("gallery-dl failed; trying direct media URL: %s", exc)
 
-    preferred = [".mp3"] if mode == "audio" else [".mp4", ".mkv", ".webm", ".mov"]
-    for ext in preferred:
-        for path in files:
-            if path.suffix.lower() == ext:
-                return path, title, platform
-    return files[0], title, platform
+    try:
+        downloaded = _direct_media_download(url, temp_dir)
+        if mode == "audio":
+            downloaded = _ffmpeg_to_mp3(downloaded, quality, temp_dir)
+        return downloaded, "Onyx Media", detect_platform(url)
+    except Exception as exc:
+        errors.append(f"direct: {clean_error(exc)}")
 
+    raise RuntimeError(" | ".join(errors[-3:]))
 
 def format_duration(seconds) -> str:
     try:
