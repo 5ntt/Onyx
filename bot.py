@@ -782,7 +782,16 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("ONYX BOT is running | max_concurrent=%s", MAX_CONCURRENT_DOWNLOADS)
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    # Python 3.14 no longer creates a default event loop automatically.
+    # python-telegram-bot's polling runner expects one to exist on the main thread.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    finally:
+        if not loop.is_closed():
+            loop.close()
 
 
 if __name__ == "__main__":
